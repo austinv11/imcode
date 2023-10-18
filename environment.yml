@@ -1,0 +1,26 @@
+name: sculpt
+channels:
+  - pytorch
+  - nvidia
+#  - xformers
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip>=21.1
+  - numpy=1.26
+  - matplotlib=3.8
+  - seaborn=0.13
+  - pytorch=2.1
+  - scikit-learn=1.3
+  - tifffile=2023.9
+  - transformers=4.34
+#  - xformers=0.0.22
+  - lightning=2.1
+  - xmltodict=0.13
+  - pip:
+    - git+https://github.com/tansey-lab/imc-tools.git#egg=imc_tools
+    - git+https://github.com/austinv11/hiera-regression.git@14f7662d7caa8fca5d9ed55017012264229bb4a9
+    - git+https://github.com/insitro/ChannelViT.git
+    - py-cpuinfo
+    - deepspeed
