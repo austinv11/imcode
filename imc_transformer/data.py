@@ -20,6 +20,7 @@ from pathlib import Path
 import lightning.pytorch as pl
 import torch
 import torchvision
+from torch.utils.data import TensorDataset
 from torchvision.transforms.v2 import (
     RandomHorizontalFlip,
     RandomRotation,
@@ -30,6 +31,8 @@ from torchvision.transforms.v2 import (
 )
 from torch import nn, optim, utils
 from torch.nn.utils.rnn import pad_sequence
+
+from imc_transformer.util import random_codebook, compress
 
 
 def normalize_channel_ordering(
@@ -221,9 +224,9 @@ def TiffDataset(
 
     if size is not None:
         tensors = resize_images(tensors, size, overlap_prop=overlap_prop)
-    dataset = utils.data.TensorDataset(safe_stack(tensors))
+    tensors = safe_stack(tensors)
+    dataset = utils.data.TensorDataset(tensors, torch.ones_like(tensors))
     dataset.channel_labels = channel_labels
-    dataset.data = property(lambda self: self.tensors)
     dataset.reference_panorama_channel = 0 if include_panorama else None
     return dataset
 
@@ -365,7 +368,7 @@ def McdDataset(
             total_data[i] = torch.cat([panoramas[i].unsqueeze(0), image], dim=0)
     if size is not None:
         total_data = resize_images(total_data, size, overlap_prop=overlap_prop)
-    dataset = utils.data.TensorDataset(safe_stack(total_data))
+    dataset = TensorDataset(safe_stack(total_data), torch.ones_like(total_data))
     dataset.channel_labels = total_channels
     if include_panorama:
         dataset.reference_panorama_channel = 0
@@ -376,7 +379,7 @@ def McdDataset(
 
 def fuse_imc_datasets(
     *datasets: Union[TiffDataset, McdDataset], intersect_channels: bool = False
-) -> utils.data.Dataset:
+) -> TensorDataset:
     """
     Fuse multiple IMC datasets together. This will attempt to match channel mismatches as much as possible.
     :param datasets: The datasets to fuse.
@@ -419,97 +422,28 @@ def fuse_imc_datasets(
                 ]
         all_data.append(fixed_data)
 
-    dataset = utils.data.TensorDataset(torch.cat(all_data, dim=0))
+    dataset = TensorDataset(torch.cat(all_data, dim=0))
     dataset.channel_labels = all_channels
     return dataset
 
 
-def CompressedImcDataset(
-    compressed: torch.Tensor,
-    uncompressed: torch.Tensor,
-    assignments: torch.Tensor,
-    uncompressed_labels: torch.Tensor,
-    mask: torch.Tensor,
-) -> utils.data.Dataset:
-    dataset = utils.data.TensorDataset(compressed, uncompressed, mask)
-    dataset.assignments = assignments
-    dataset.uncompressed_labels = uncompressed_labels
+def pad_imc_dataset(dataset: TensorDataset, padding: int) -> TensorDataset:
+    data = dataset.tensors
+    new_data = []
+    for dat in data:
+        # Pad the last two dimensions (pixels) with 0s
+        padding_before = padding // 2
+        padding_after = padding - padding_before
+        # Note: The mask should end up getting padded with zeros, indicating that the pixels are not valid
+        dat = torch.nn.functional.pad(
+            dat,
+            (padding_before, padding_after, padding_before, padding_after),
+            mode="constant",
+            value=0,
+        )
+        new_data.append(dat)
+    dataset.tensors = tuple(new_data)
     return dataset
-
-
-def synthetic_compression(
-    data: torch.tensor, n_compressed_channels: int = None
-) -> tuple[torch.tensor, torch.tensor]:
-    """
-    Synthetically compress the signals to be pairwise combinations of the original signals.
-    :param data: Original data (n_channels x n_pixels x n_pixels). Each channel is an observation.
-    :param n_compressed_channels: The number of compressed channels to use. If None, this will be determined automatically.
-    :return: Compressed data (n_compressed_channels x n_pixels x n_pixels), and the observation to compressed channel
-        assignments. Each channel can contain multiple observations and each observation is replicated to exactly 2
-        channels.
-    """
-    # First, calculate the number of required compressed channels if we want to use 2 signals per observation.
-    n_obs = data.shape[0]
-    n_channels = data.shape[1]
-    n_compressed_channels = (
-        torch.ceil(torch.log2(torch.tensor(n_channels))).int()
-        if n_compressed_channels is None
-        else n_compressed_channels
-    )
-
-    # Get the possible pairwise combinations without replacement
-    compressed_assignments = torch.zeros(
-        (n_channels, n_compressed_channels), dtype=bool
-    )
-    compressed_data = torch.zeros((n_obs, n_compressed_channels, *data.shape[2:]))
-    curr_compressed_channel = 0
-    for channel in itertools.chain(*itertools.repeat(range(n_channels), 2)):
-        compressed_assignments[channel, curr_compressed_channel] = True
-        compressed_data[:, curr_compressed_channel, :, :] += data[:, channel, :, :]
-        curr_compressed_channel += 1
-        if curr_compressed_channel == n_compressed_channels:
-            curr_compressed_channel = 0
-
-    return compressed_data, compressed_assignments
-
-
-def pad_imc_dataset(
-    dataset: CompressedImcDataset, padding: int
-) -> CompressedImcDataset:
-    data = dataset.tensors[0]
-    # Pad the last two dimensions (pixels) with 0s
-    padding_before = padding // 2
-    padding_after = padding - padding_before
-    # Note: The mask should end up getting padded with zeros, indicating that the pixels are not valid
-    data = torch.nn.functional.pad(
-        data,
-        (padding_before, padding_after, padding_before, padding_after),
-        mode="constant",
-        value=0,
-    )
-    dataset.tensors = (data,)
-    return dataset
-
-
-def _compress_dataset(
-    dataset: utils.data.TensorDataset, codebook: torch.Tensor
-) -> CompressedImcDataset:
-    uncompressed = dataset.tensors[0]
-    if codebook is None:
-        compressed, codebook = synthetic_compression(uncompressed)
-    else:
-        compressed = torch.matmul(uncompressed, codebook)
-
-    return (
-        CompressedImcDataset(
-            compressed,
-            uncompressed,
-            codebook,
-            dataset.channel_labels,
-            compressed.new_ones((compressed.shape[0], *compressed.shape[2:])),
-        ),
-        codebook,
-    )
 
 
 def _generate_dataset(
@@ -517,7 +451,6 @@ def _generate_dataset(
     mcds: list[str],
     image_size: Optional[tuple[int, int]],
     patch_overlap: float,
-    codebook: torch.Tensor,
     out_dir: str,
 ):
     """
@@ -550,29 +483,20 @@ def _generate_dataset(
         fused = pad_imc_dataset(fused, 32 - (size[0] % 32))
         size = tuple(fused.tensors[0].shape[2:])
     n_proteins = len(fused.channel_labels)
-    # Compression
-    compressed, codebook = _compress_dataset(fused, codebook)
-    n_channels = compressed.tensors[0].shape[1]
-    codebook_labels = compressed.uncompressed_labels
 
     metadata = {
         "size": size,
-        "n_channels": n_channels,
         "n_proteins": n_proteins,
-        "codebook_labels": codebook_labels,
-        "codebook": codebook,
+        "channel_labels": fused.channel_labels,
     }
 
     out_dir.mkdir(exist_ok=True)
     torch.save(metadata, out_dir / "metadata.pt")
     images_dir = out_dir / "images"
     images_dir.mkdir(exist_ok=True)
-    for i, (compressed, uncompressed, mask) in enumerate(
-        zip(compressed.tensors[0], compressed.tensors[1], compressed.tensors[2])
-    ):
+    for i, (uncompressed, mask) in enumerate(zip(fused.tensors[0], fused.tensors[1])):
         image_dir = images_dir / f"{i}"
         image_dir.mkdir(exist_ok=True)
-        torch.save(compressed.clone(), image_dir / "image_compressed.pt")
         torch.save(uncompressed.clone(), image_dir / "image_uncompressed.pt")
         torch.save(mask.clone(), image_dir / "mask.pt")
 
@@ -586,10 +510,8 @@ class DirectoryDataset(utils.data.Dataset):
         self.parent_dir = Path(parent_dir)
         metadata = torch.load(self.parent_dir / "metadata.pt")
         self.size = metadata["size"]
-        self.n_channels = metadata["n_channels"]
         self.n_proteins = metadata["n_proteins"]
-        self.codebook_labels = metadata["codebook_labels"]
-        self.codebook = metadata["codebook"]
+        self.channel_labels = metadata["channel_labels"]
         self.data_paths = []
         for f in self.parent_dir.glob("images/*"):
             if not f.is_dir():
@@ -610,20 +532,34 @@ class DirectoryDataset(utils.data.Dataset):
         return tuple([torch.load(path) for path in paths])
 
 
-class SpikeInChannelTransform(nn.Module):
+@torch.jit.script
+def _apply_all(
+    tensor: Union[torch.Tensor, tuple[torch.Tensor]], funcs: list[torch.nn.Module]
+) -> Union[torch.Tensor, tuple[torch.Tensor]]:
+    if funcs is None or len(funcs) == 0:
+        return tensor
+
+    for func in funcs:
+        tensor = func(tensor)
+    return tensor
+
+
+class CodebookCompressionTransform(nn.Module):
     """
-    Augment the data by adding in a few channels of known uncompressed values.
+    Use a codebook to compress the channels of an image.
     """
 
-    def __init__(self, spike_in_channels: list[int]):
+    def __init__(self, codebook: torch.Tensor):
         super().__init__()
-        self.spike_in_channels = spike_in_channels
+        self.register_buffer("codebook", codebook)
 
-    def forward(self, x):
-        input, output, mask = x
-        spike_in = output[self.spike_in_channels, :, :]
-        input = torch.cat([input, spike_in], dim=0)
-        return input, output, mask
+    def forward(
+        self, *x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # We will assume the first tensor is the data and the second is the mask
+        uncompressed, mask = x
+        compressed = compress(uncompressed, self.codebook) * mask  # Ensure 0s are 0s
+        return compressed, uncompressed, mask
 
 
 class LambdaDataset(utils.data.Dataset):
@@ -632,23 +568,30 @@ class LambdaDataset(utils.data.Dataset):
     """
 
     def __init__(
-        self, dataset: utils.data.Dataset, total_func, input_func, prediction_func
+        self,
+        dataset: utils.data.Dataset,
+        all_transforms: list[torch.nn.Module],
+        *split_transforms: list[torch.nn.Module],
     ):
         self.dataset = dataset
-        self.total_func = total_func
-        self.input_func = input_func
-        self.prediction_func = prediction_func
+        self.all_funcs = all_transforms
+        self.split_funcs = split_transforms
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        initial_input, initial_output, initial_mask = self.total_func(self.dataset[idx])
-        if self.input_func is not None:
-            initial_input = self.input_func(initial_input)
-        if self.prediction_func is not None:
-            initial_output = self.prediction_func(initial_output)
-        return initial_input, initial_output, initial_mask
+        transformed = _apply_all(self.dataset[idx], self.all_funcs)
+        if self.split_funcs is None or len(self.split_funcs) == 0:
+            return transformed
+        transformed = tuple(
+            _apply_all(dat, funcs) for dat, funcs in zip(transformed, self.split_funcs)
+        )
+        return transformed
+
+    # Defer attribute access to the dataset
+    def __getattr__(self, name):
+        return getattr(self.dataset, name)
 
 
 class InSilicoCompressedImcDataset(pl.LightningDataModule):
@@ -660,7 +603,7 @@ class InSilicoCompressedImcDataset(pl.LightningDataModule):
         patch_overlap: float = 0,
         save_dir: str = None,
         batch_size: int = 2,
-        seed: int = 12345,
+        seed: int = 1234567890,
         codebook: torch.Tensor = None,
         generate: bool = True,
         random_flip: float = 0,
@@ -680,7 +623,7 @@ class InSilicoCompressedImcDataset(pl.LightningDataModule):
         self.n_channels = None
         self.n_proteins = None
         self.codebook = codebook
-        self.codebook_labels = None
+        self.channel_labels = None
         self.initialized = False
         self.random_flip = random_flip
         self.random_rotate = random_rotate
@@ -703,7 +646,6 @@ class InSilicoCompressedImcDataset(pl.LightningDataModule):
                 self.mcds,
                 image_size,  # Only used when generating the dataset
                 patch_overlap,  # Only used when generating the dataset
-                self.codebook,
                 self.save_dir,
             )
 
@@ -711,28 +653,39 @@ class InSilicoCompressedImcDataset(pl.LightningDataModule):
         if self.initialized:
             return
 
-        dataset = DirectoryDataset(
-            self.save_dir, "image_compressed.pt", "image_uncompressed.pt", "mask.pt"
-        )
+        dataset = DirectoryDataset(self.save_dir, "image_uncompressed.pt", "mask.pt")
 
         self.size = dataset.size
-        self.n_channels = dataset.n_channels
         self.n_proteins = dataset.n_proteins
-        self.codebook_labels = dataset.codebook_labels
-        self.codebook = dataset.codebook
+        self.channel_labels = dataset.channel_labels
 
-        if self.spike_in_channels > 0:
-            self.spike_in_channels = torch.randperm(self.n_proteins)[
-                : self.spike_in_channels
-            ]
-            dataset = LambdaDataset(
-                dataset,
-                SpikeInChannelTransform(self.spike_in_channels),
-                None,
-                None,
+        codebook_path = Path(self.save_dir) / "codebook.pt"
+        if self.codebook is None and not codebook_path.exists():
+            assert self.spike_in_channels is None or isinstance(
+                self.spike_in_channels, int
             )
-        else:
-            self.spike_in_channels = []
+            self.codebook, self.spike_in_channels = random_codebook(
+                self.n_proteins,
+                n_compressed_channels=None,
+                spike_in=self.spike_in_channels,
+            )
+            torch.save(
+                {
+                    "codebook": self.codebook.clone(),
+                    "spike_in_channels": self.spike_in_channels.clone(),
+                },
+                codebook_path,
+            )
+        elif self.codebook is None:
+            codebook_data = torch.load(codebook_path)
+            self.codebook = codebook_data["codebook"]
+            self.spike_in_channels = codebook_data["spike_in_channels"]
+            del codebook_data
+        elif self.spike_in_channels is None:
+            self.spike_in_channels = torch.tensor([])
+        self.n_channels = self.codebook.shape[1]
+
+        dataset = LambdaDataset(dataset, [CodebookCompressionTransform(self.codebook)])
 
         self.train, self.val, self.test = utils.data.random_split(
             dataset,
@@ -774,10 +727,10 @@ class InSilicoCompressedImcDataset(pl.LightningDataModule):
             transforms = Compose(transforms)
             self.train = LambdaDataset(
                 self.train,
-                transforms,
-                RandomErasing(p=self.random_erase)
+                [transforms],
+                [RandomErasing(p=self.random_erase), None, None]
                 if self.random_erase > 0
-                else None,  # Only apply erasing to the input
+                else None,  # Only apply erasing to the compressed input and not the mask or uncompressed input
                 None,
             )
 

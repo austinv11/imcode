@@ -520,7 +520,7 @@ def generate_examples(
             else compressed.squeeze(0),
             pred,
             dataset.codebook,
-            dataset.codebook_labels,
+            dataset.channel_labels,
             output_dir / f"sample_{i}.pdf",
             dataset.spike_in_channels,
             sanity_check=model.sanity_check,
