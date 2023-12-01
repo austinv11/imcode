@@ -1,4 +1,4 @@
-FROM gpuci/miniforge-cuda:11.8-base-ubuntu20.04
+FROM gpuci/miniforge-cuda:11.8-devel-ubuntu20.04
 # Build a dev environment for the project
 
 # Use mamba solver
@@ -11,7 +11,7 @@ COPY environment.yml .
 RUN conda env update -n base --file environment.yml
 
 # Ensure we have gpu-capable pytorch
-RUN conda install -c pytorch -c nvidia -y -n base pytorch torchvision torchaudio pytorch-cuda=11.8
+RUN conda install -c pytorch -c nvidia -y -n base pytorch torchvision torchaudio pytorch-cuda=11.8 cuda-nvcc
 
 USER root
 
@@ -27,7 +27,7 @@ RUN echo "#!/bin/bash --login" > /usr/bin/python-conda && \
     chmod +x /usr/bin/python-conda
 
 # Copy files to the container
-COPY . /workspace
-WORKDIR /workspace
+#COPY . /workspace
+#WORKDIR /workspace
 
-ENTRYPOINT ( python-conda main.py )
+ENTRYPOINT ["python-conda"]

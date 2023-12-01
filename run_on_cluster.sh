@@ -3,8 +3,13 @@
 docker build -t austinv11/imcode:latest .
 docker push austinv11/imcode:latest
 
-ssh -A varela@juno "module load singularity/3.7.1"\
-" && singularity pull docker:://austinv11/imcode:latest"\
-" && echo 'bash -c singularity run --bind /work/tansey/sanayeia/IMC_Data/:/data imcode.sig' >> run_imcode.sh"\
-" && chmod +x run_imcode.sh"\
-" && bsub -n 1 -W 4:00 -R 'span[hosts=1] rusage[mem=16] -e imcode.err -o imcode.out ./run_imcode.sh'"
+# Copy nextflow and python files to juno
+rsync -avzP --progress nextflow/* varelaa@juno-xfer01.mskcc.org:/work/tansey/varelaa/imcode/
+rsync -avzP --progress --exclude imc_transformer/__pycache__ imc_transformer varelaa@juno-xfer01:/work/tansey/varelaa/imcode/
+
+ssh -A varelaa@juno "cd /work/tansey/varelaa/imcode"\
+" && wget https://raw.githubusercontent.com/tansey-lab/juno-nextflow-template/main/juno_nextflow.sh -O juno_nextflow.sh"\
+" && chmod +x juno_nextflow.sh"\
+" && rm -rf /work/tansey/varelaa/.singularity/cache"\
+" && rm -f /work/tansey/varelaa/tmp-singularity-cachedir/austinv11-imcode-latest.img"\
+" && screen ./juno_nextflow.sh run -resume -N varelaa@mskcc.org --data_path /work/tansey/sanayeia/IMC_Data/stacks/ --script_dir imc_transformer/ train.nf"

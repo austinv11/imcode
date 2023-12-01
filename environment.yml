@@ -24,3 +24,4 @@ dependencies:
     - git+https://github.com/insitro/ChannelViT.git
     - py-cpuinfo
     - deepspeed
+    - docopt-ng==0.9.0
