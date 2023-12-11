@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from timm.layers.activations import Swish
 from tqdm import tqdm
 
-from imc_transformer.util import _initialize
+from util import _initialize, mask_loss, compress, EPS
 
 
 @torch.jit.script
@@ -23,7 +23,7 @@ def _gather(consts: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
 
 @torch.jit.script
 def _poisson_div(
-    lmbda1: torch.Tensor, lmbda2: torch.Tensor, eps: float = 1e-12
+    lmbda1: torch.Tensor, lmbda2: torch.Tensor, eps: float = EPS
 ) -> torch.Tensor:
     """
     Poisson divergence between two Poisson distributions.
@@ -36,21 +36,31 @@ def _poisson_div(
 
 
 @torch.jit.script
+def _stable_division(
+    x: torch.Tensor, y: torch.Tensor, eps: float = EPS
+) -> torch.Tensor:
+    """
+    Stable division.
+    """
+    return x / (y.clamp(min=eps))
+
+
+@torch.jit.script
 def _jump_loss(
     pred_x0: torch.Tensor,
     x0: torch.Tensor,
     deltas: torch.Tensor,
     t: torch.Tensor,
-    offset: int = 1,  # FIXME: This is a hack to avoid numerical issues
+    eps: float = EPS,
 ) -> torch.Tensor:
     """
     Calculate the JUMP loss. (poisson kl)
     """
     delta = _gather(deltas, t)
-    pred_x0 = (pred_x0 + offset) * delta
-    x0 = (x0 + offset) * delta
-    return _poisson_div(x0, pred_x0)
-    # return _poisson_div(pred_x0, x0)
+    pred_x0 = (pred_x0) * delta
+    x0 = (x0) * delta
+    return _poisson_div(x0, pred_x0, eps)
+    # return _poisson_div(pred_x0, x0, eps)
 
 
 def _linear_schedule(beta_start: float, beta_end: float, n_steps: int) -> torch.Tensor:
@@ -79,8 +89,6 @@ class DiffusionIMC(nn.Module):
     """
     A diffusion model for IMC data.
     Heavily draws from https://nn.labml.ai/diffusion/ddpm.html for the implementation details.
-    Inspired by Palette: https://arxiv.org/pdf/2111.05826.pdf as we build a denoising diffusion model where the task
-    is to generate the original image from noise conditioned on the compressed image.
     """
 
     def __init__(
@@ -99,7 +107,8 @@ class DiffusionIMC(nn.Module):
         :param unet_factory: A factory function that returns a U-Net given the number of input image channels to use and output channels.
         :param n_steps: The number of diffusion steps.
         :param raw_counts: Whether to use raw counts or log counts.
-        :param sampler: Either 'ddim' (Denoising Diffusion Implicit Model), 'ddpm' (Denoising Diffusion Probabilistic Model), or 'jump' (Thinning and Thickening Latent Counts) sampling schemes.
+        :param sampler: Either 'ddim' (Denoising Diffusion Implicit Model), 'ddpm' (Denoising Diffusion Probabilistic Model), 'jump' (Thinning and Thickening Latent Counts), or 'overdispersed_jump' sampling schemes.
+            NOTE: 'jump' and 'overdispersed_jump' require raw_counts=True. Additionally, overdispersed_jump requires a doubling of the output channels in the U-Net output.
         :param loss_function: The loss function to use.
         """
         super().__init__()
@@ -112,13 +121,14 @@ class DiffusionIMC(nn.Module):
             self.sampler = DDIMSampler(n_steps)
         elif sampler == "ddpm":
             self.sampler = DDPMSampler(n_steps)
-        elif sampler == "jump":
+        elif sampler == "jump" or sampler == "overdispersed_jump":
             self.sampler = JUMPSampler(
                 n_steps,
                 # beta_start=0.001,
                 # beta_end=0.2,
-                lmbda=100.0,
+                lmbda=25.0,
                 beta_schedule="linear",
+                overdispersed=sampler == "overdispersed_jump",
             )
             assert raw_counts, "JUMP sampler requires raw counts"
         else:
@@ -170,8 +180,6 @@ class DiffusionIMC(nn.Module):
         :param output_intermediates: Whether to output the intermediate images.
         :return: The final sampled image. If output_intermediates is True, will instead return all the intermediate images.
         """
-        # if not self.raw_counts:
-        c = torch.log1p(c + 1)  # Map the embedding to a more manageable range
         img = self.sampler.sample_image(self, c, output_intermediates)
         if not self.raw_counts:
             if output_intermediates:
@@ -212,6 +220,7 @@ class DiffusionIMC(nn.Module):
         x0: torch.Tensor,
         c: torch.Tensor,
         mask: torch.Tensor,
+        codebook: torch.Tensor,
         noise: Optional[torch.Tensor] = None,
     ):
         """
@@ -220,14 +229,14 @@ class DiffusionIMC(nn.Module):
         :param x0: The initial image minibatch.
         :param c: The compressed data image minibatch.
         :param mask: The mask for the data.
+        :param codebook: The codebook used for compressing the data.
         :param noise: The ground truth noise. If None, will be sampled from N(0, 1).
         :return The loss.
         """
-        c = torch.log1p(c + 1)
         if not self.raw_counts:
-            x0 = torch.log1p(x0 + 1)
+            x0 = torch.log1p(x0)
 
-        return self.sampler.loss(self, x0, c, mask, noise)
+        return self.sampler.loss(self, x0, c, mask, codebook, noise)
 
 
 class DiffusionSampler(nn.Module):
@@ -322,6 +331,7 @@ class DiffusionSampler(nn.Module):
         x0: torch.Tensor,
         c: torch.Tensor,
         mask: torch.Tensor,
+        codebook: torch.Tensor,
         noise: Optional[torch.Tensor] = None,
     ):
         """
@@ -331,6 +341,7 @@ class DiffusionSampler(nn.Module):
         :param x0: The initial image minibatch.
         :param c: The compressed data image minibatch.
         :param mask: The mask for the data.
+        :param codebook: The codebook used for compressing the data.
         :param noise: The ground truth noise. If None, will be sampled from N(0, 1).
         :return The loss.
         """
@@ -351,7 +362,8 @@ class DiffusionSampler(nn.Module):
             loss = _poisson_div(predicted_noise, noise)
         else:
             loss = F.mse_loss(predicted_noise, noise, reduction="none")
-        loss = (loss * mask.unsqueeze(1).float()).sum() / mask.sum()
+
+        loss = mask_loss(loss, mask, normalize=True, reduce=True)
         return loss
 
 
@@ -371,6 +383,7 @@ class JUMPSampler(DiffusionSampler):
         beta_schedule: str = "linear",
         alphas: list[float] = None,
         lmbda: float = 10.0,
+        overdispersed: bool = False,
     ):
         """
         :param n_steps: The number of diffusion steps.
@@ -379,8 +392,10 @@ class JUMPSampler(DiffusionSampler):
         :param beta_schedule: The schedule to use for time. Either "linear" or "cosine".
         :param alphas: The "thinning coefficients" for each time step, representing the noise variance. Must approach 0 as t -> inf.
         :param lmbda: The scaling parameter. This is the rate parameter for the Poisson distribution.
+        :param overdispersed: Whether to use the overdispersed JUMP sampler. This requires doubling the output channels in the U-Net.
         """
         super().__init__(n_steps)
+        self.overdispersed = overdispersed
         if beta_schedule == "linear":
             # Linear variance schedule
             self.register_buffer(
@@ -453,11 +468,10 @@ class JUMPSampler(DiffusionSampler):
     ) -> Union[torch.Tensor, list[torch.Tensor]]:
         if output_intermediates:
             tracked_images = []
-        pred_x0 = torch.zeros(
+        z_t = torch.zeros(
             (c.shape[0], model.uncompressed_channels, *c.shape[2:]),
             device=c.device,
         )
-        z_t = torch.zeros_like(pred_x0)
         for t in tqdm(
             reversed(range(self.n_steps)),
             desc="Thickening image...",
@@ -469,6 +483,8 @@ class JUMPSampler(DiffusionSampler):
             )
 
             if output_intermediates:
+                # z_t is the current process, pred_x0 is what the model thinks is the final result
+                # TODO: Add option to output both?
                 tracked_images.append((z_t / self.lmbda).detach().cpu())
 
         if output_intermediates:
@@ -488,11 +504,20 @@ class JUMPSampler(DiffusionSampler):
         """
         # Rescale for numerical stability
         scaled_xt = xt / (self.lmbda * self.alpha[t])
+
         predicted_x0 = torch.nn.functional.softplus(
             model.unet_backbone(
-                scaled_xt, c, torch.full((xt.shape[0],), t.item(), device=xt.device)
+                scaled_xt,
+                c,
+                torch.full((xt.shape[0],), t.item(), device=xt.device),
             )
         ).clamp(min=0)
+        if self.overdispersed:
+            # Convert params to lambda
+            predicted_x0_alpha, predicted_x0_beta = torch.chunk(predicted_x0, 2, dim=1)
+            predicted_x0 = _stable_division(
+                predicted_x0_alpha, predicted_x0_beta
+            )  # Expected value of a Gamma distribution
         rate = _gather(self.deltas, t) * predicted_x0
         z_prev = torch.poisson(rate) + xt
         return z_prev, predicted_x0
@@ -550,6 +575,7 @@ class JUMPSampler(DiffusionSampler):
         x0: torch.Tensor,
         c: torch.Tensor,
         mask: torch.Tensor,
+        codebook: torch.Tensor,
         noise: Optional[torch.Tensor] = None,
     ):
         """
@@ -559,6 +585,7 @@ class JUMPSampler(DiffusionSampler):
         :param x0: The initial image minibatch.
         :param c: The compressed data image minibatch.
         :param mask: The mask for the data.
+        :param codebook: The codebook used for compressing the data.
         :param noise: THIS IS IGNORED.
         :return The loss.
         """
@@ -567,14 +594,30 @@ class JUMPSampler(DiffusionSampler):
 
         pred_x0 = self.sample_q(model, x0, c, t)
 
-        # Calculate the loss accounting for masks
-        loss = _jump_loss(pred_x0, x0, self.deltas, t)
-        indices = list(range(1, loss.ndim))
-        # Loss per image
-        mask = mask.unsqueeze(1).float()
-        loss = (loss * mask).sum(dim=indices) / (mask.sum(dim=indices))  # Total loss
-        loss = loss.sum()
-        return loss
+        if self.overdispersed:
+            # Convert params to lambda
+            pred_x0_alpha, pred_x0_beta = torch.chunk(pred_x0, 2, dim=1)
+            pred_x0 = _stable_division(
+                pred_x0_alpha, pred_x0_beta
+            )  # Expected value of a Gamma distribution
+        original_reconstruction_loss = _jump_loss(pred_x0, x0, self.deltas, t)
+        # reconstruction_loss = mask_loss(
+        #     original_reconstruction_loss, mask, normalize=False, reduce=True
+        # )
+        compressed_reconstruction_loss = _jump_loss(
+            compress(pred_x0, codebook), c, self.deltas, t
+        )
+        compressed_mask = compress(mask, codebook) > 0
+        reconstruction_loss = mask_loss(
+            original_reconstruction_loss, mask, normalize=False, reduce=True
+        ) * mask_loss(
+            compressed_reconstruction_loss,
+            compressed_mask,
+            normalize=False,
+            reduce=True,
+        )
+
+        return reconstruction_loss.sum()
 
 
 class DDPMSampler(DiffusionSampler):
@@ -854,11 +897,14 @@ class DiffusionUnet(nn.Module):
         feature_channels: int = 32,
         feature_mult: tuple[int, ...] = (1, 2, 2, 4),
         use_attn: tuple[bool, ...] = (False, False, True, True),
+        context_attn: bool = True,
+        transformer_blocks: int = 0,
         n_blocks: int = 2,
         n_groups: int = 32,
         dropout: float = 0,
         activation: type[nn.Module] = Swish,
         n_heads: int = 1,
+        normalize_condition: bool = True,
         embedding_type: Union[
             Literal["shift"], Literal["scale"], Literal["shift_and_scale"]
         ] = "shift",
@@ -870,22 +916,31 @@ class DiffusionUnet(nn.Module):
         :param feature_channels: The number of features to embed the image into.
         :param feature_mult: The feature multiplier at each resolution.
         :param use_attn: Whether to apply attention at each resolution.
+        :param context_attn: Whether to use context attention inspired by ContextDiffusion: https://arxiv.org/pdf/2312.03584.pdf, else, use self-attention exclusively.
+        :param transformer_blocks: If greater than 0, we will apply a these many transformer blocks, rather than using just attention. The transformer blocks follow the SpatialTransformer architecture of StableDiffusion.
         :param n_blocks: The number of residual blocks at each resolution.
         :param n_groups: The number of groups for group normalization.
         :param dropout: The dropout rate.
         :param activation: The nonlinearity to apply.
         :param n_heads: The number of heads for attention.
-        :param embedding_type: How to embed the time and condition channels. Either 'shift', 'scale', or 'shift_and_scale'.
+        :param normalize_condition: Whether to normalize the condition embedding.
+        :param embedding_type: How to embed the time and condition channels. Either 'shift', 'scale', or 'shift_and_scale'. Shift and scale is used in Learning to Jump
         """
         super().__init__()
         n_resolutions = len(feature_mult)
+        self.context_attn = context_attn
         self.initial_projection = nn.Conv2d(
             image_channels, feature_channels, kernel_size=(3, 3), padding=(1, 1)
         )
         self.time_embedding = TimeEmbedding(
             feature_channels, embedding_mult=4, dropout=dropout, act=activation
         )
-        self.class_embedding = nn.Sequential(
+
+        self.condition_embedding = nn.Sequential(
+            nn.BatchNorm2d(conditional_channels)
+            if normalize_condition
+            else nn.Identity(),  # Normalizes the input count data
+            # https://towardsdatascience.com/replace-manual-normalization-with-batch-normalization-in-vision-ai-models-e7782e82193c
             nn.Conv2d(
                 conditional_channels,
                 feature_channels,
@@ -902,9 +957,9 @@ class DiffusionUnet(nn.Module):
 
         # Build the blocks
         down = []
-        out_channels = in_channels = (
-            feature_channels * 2
-        )  # Multiply 2 since the first half of channels are from the image and the second half are from the condition embedding
+        out_channels = in_channels = feature_channels * (
+            1 if context_attn else 2
+        )  # Multiply 2 since the first half of channels are from the image and the second half are from the condition embedding when context_attn is False
         for i in range(n_resolutions):
             out_channels = in_channels * feature_mult[i]
             for j in range(n_blocks):
@@ -918,6 +973,8 @@ class DiffusionUnet(nn.Module):
                         dropout=dropout,
                         act=activation,
                         n_heads=n_heads,
+                        context_attn=context_attn,
+                        transformer_blocks=transformer_blocks,
                         embedding_type=embedding_type,
                     )
                 )
@@ -931,6 +988,9 @@ class DiffusionUnet(nn.Module):
             n_groups=n_groups,
             dropout=dropout,
             act=activation,
+            n_heads=n_heads,
+            context_attn=context_attn,
+            transformer_blocks=transformer_blocks,
             embedding_type=embedding_type,
         )
 
@@ -949,6 +1009,8 @@ class DiffusionUnet(nn.Module):
                         dropout=dropout,
                         act=activation,
                         n_heads=n_heads,
+                        context_attn=context_attn,
+                        transformer_blocks=transformer_blocks,
                         embedding_type=embedding_type,
                     )
                 )
@@ -964,6 +1026,8 @@ class DiffusionUnet(nn.Module):
                     dropout=dropout,
                     act=activation,
                     n_heads=n_heads,
+                    context_attn=context_attn,
+                    transformer_blocks=transformer_blocks,
                     embedding_type=embedding_type,
                 )
             )
@@ -983,34 +1047,35 @@ class DiffusionUnet(nn.Module):
 
     def reset_parameters(self):
         _initialize(self.initial_projection)
-        _initialize(self.class_embedding)
+        _initialize(self.condition_embedding)
         _initialize(self.final_projection)
 
     def forward(self, x, c, t):
         # Get the time embedding
         t = self.time_embedding(t)
         # Get the class embedding
-        c = self.class_embedding(c)
+        c = self.condition_embedding(c)
         # Project the image
         x = self.initial_projection(x)
-        # Concatenate the condition embedding
-        xc = torch.cat([x, c], dim=1)
+        if not self.context_attn:
+            # Concatenate the condition embedding for future self-attention
+            x = torch.cat([x, c], dim=1)
         # Store the skip connections
-        h = [xc]
+        h = [x]
         # Downsample half
         for block in self.down:
-            xc = block(xc, t)
-            h.append(xc)
+            x, c = block(x, t, c)
+            h.append(x)
         # Middle
-        xc = self.middle(xc, t)
+        x, c = self.middle(x, t, c)
         # Upsample half
         for block in self.up:
             if isinstance(block, Upsample):
-                xc = block(xc, t)
+                x, c = block(x, t, c)
             else:
-                xc = block(torch.cat([xc, h.pop()], dim=1), t)
+                x, c = block(torch.cat([x, h.pop()], dim=1), t, c)
         # Final projection
-        y = self.final_projection(self.act(self.norm(xc)))
+        y = self.final_projection(self.act(self.norm(x)))
         return y
 
 
@@ -1091,6 +1156,7 @@ class ResidualBlock(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
+        condition_channels: int,
         time_channels: int,
         embedding_style: Union[
             Literal["shift"], Literal["scale"], Literal["shift_and_scale"]
@@ -1098,6 +1164,8 @@ class ResidualBlock(nn.Module):
         n_groups: int = 32,
         dropout: float = 0,
         act: type[nn.Module] = Swish,
+        self_attn: bool = False,
+        n_heads: int = 1,
     ):
         """
         :param in_channels: The input channels.
@@ -1108,10 +1176,12 @@ class ResidualBlock(nn.Module):
         :param n_groups: The number of groups for group normalization.
         :param dropout: The dropout rate.
         :param act: The non-linearity to use.
+        :param self_attn: Should this block include a self-attention step?
         """
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.condition_channels = condition_channels
         self.has_shift = embedding_style in ("shift", "shift_and_scale")
         self.has_scale = embedding_style in ("scale", "shift_and_scale")
         assert self.has_shift or self.has_scale
@@ -1120,6 +1190,14 @@ class ResidualBlock(nn.Module):
             nn.GroupNorm(n_groups, in_channels),
             act(),
             nn.Conv2d(in_channels, out_channels, kernel_size=(3, 3), padding=(1, 1)),
+        )
+
+        self.condition_projection = nn.Sequential(
+            nn.GroupNorm(n_groups, condition_channels),
+            act(),
+            nn.Conv2d(
+                condition_channels, out_channels, kernel_size=(3, 3), padding=(1, 1)
+            ),
         )
 
         self.time_decoder = nn.Sequential(
@@ -1139,6 +1217,11 @@ class ResidualBlock(nn.Module):
             nn.Conv2d(out_channels, out_channels, kernel_size=(3, 3), padding=(1, 1)),
         )
 
+        if self_attn:
+            self.attn = SelfAttentionBlock(out_channels, n_heads, dropout=dropout)
+        else:
+            self.attn = None
+
         if in_channels != out_channels:
             # Projection for the skip connection
             self.projection = nn.Conv2d(in_channels, out_channels, kernel_size=(1, 1))
@@ -1152,9 +1235,11 @@ class ResidualBlock(nn.Module):
         _initialize(self.conv2, scale=0.0)
         _initialize(self.projection)
         _initialize(self.time_decoder)
+        _initialize(self.condition_projection)
 
-    def forward(self, x, time):
+    def forward(self, x, time, c):
         z = self.conv1(x)
+        c_proj = self.condition_projection(c)
 
         # Condition on time
         t_embed = self.time_decoder(time)[:, :, None, None]
@@ -1174,35 +1259,61 @@ class ResidualBlock(nn.Module):
         z = z * t_scale + t_shift
 
         z = self.conv2(z)
-        return z + self.projection(x)
+
+        if self.attn is not None:
+            z, c_proj = self.attn(z, time, c_proj)
+
+        return z + self.projection(x), c_proj
 
 
-class AttentionBlock(nn.Module):
-    """
-    Multi-headed attention block, using flash attention.
-    """
-
+class AttentionModule(nn.Module):
     def __init__(
         self,
         n_channels: int,
         n_heads: int = 1,
         head_dim: int = None,
-        n_groups: int = 32,
         dropout: float = 0,
+        pre_norm: bool = True,  # https://arxiv.org/pdf/2002.04745.pdf
+        compute_q: bool = True,
+        compute_k: bool = True,
+        compute_v: bool = True,
     ):
         """
         :param n_channels: Number of channels.
         :param n_heads: The number of heads.
         :param head_dim: The dimension of each head. By default, uses the number of channels.
-        :param n_groups: The number of groups for group normalization.
         :param dropout: The dropout rate.
+        :param pre_norm: Whether to apply normalization before the attention block.
+        :param compute_q: Whether to compute Q if it is not provided.
+        :param compute_k: Whether to compute K if it is not provided.
+        :param compute_v: Whether to compute V if it is not provided.
+
+        Note: For self-attention, compute_q, compute_k, and compute_v should all be True.
         """
         super().__init__()
         if head_dim is None:
             head_dim = n_channels
+        self.pre_norm = pre_norm
+        if self.pre_norm:
+            self.norm1 = nn.LayerNorm(n_channels)
+            self.norm2 = nn.LayerNorm([n_heads, head_dim])
+        else:
+            self.norm1 = nn.Identity()
+            self.norm2 = nn.Identity()
 
-        self.norm = nn.GroupNorm(n_groups, n_channels)
-        self.projection = nn.Linear(n_channels, n_heads * head_dim * 3)  # Projects QKV
+        if compute_q:
+            self.projection_q = nn.Linear(n_channels, n_heads * head_dim)
+        else:
+            self.projection_q = nn.Identity()
+        if compute_k:
+            self.projection_k = nn.Linear(n_channels, n_heads * head_dim)
+        else:
+            self.projection_k = nn.Identity()
+        if compute_v:
+            self.projection_v = nn.Linear(n_channels, n_heads * head_dim)
+        else:
+            self.projection_v = nn.Identity()
+
         self.out = nn.Linear(n_heads * head_dim, n_channels)
         self.scale = head_dim**-0.5  # Scale factor for QK^T
         self.n_heads = n_heads
@@ -1211,38 +1322,424 @@ class AttentionBlock(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        _initialize(self.projection)
+        _initialize(self.projection_q)
+        _initialize(self.projection_k)
+        _initialize(self.projection_v)
         _initialize(self.out, scale=0.0)
 
     def forward(
         self,
-        x: torch.Tensor,
-        t: Optional[torch.Tensor] = None,
-    ):
-        # Add the conditional embedding
-        xc_orig = x
+        x: torch.Tensor,  # (B, C, H, W)
+        q: torch.Tensor = None,  # (B, HW, HEADS, HEAD_DIM)
+        k: torch.Tensor = None,  # (B, HW, HEADS, HEAD_DIM)
+        v: torch.Tensor = None,  # (B, HW, HEADS, HEAD_DIM)
+        channels_first: bool = True,
+    ) -> torch.Tensor:
+        x_resid = x
+        # Move channels last and get the original shape
+        if channels_first:
+            batch_size, n_channels, height, width = x.shape
+            x = x.permute(0, 2, 3, 1)
+        else:
+            batch_size, height, width, n_channels = x.shape
+        # Collapse HW
+        x = x.view(batch_size, -1, n_channels)  # (B, HW, C)
+        # Apply normalization
+        x = self.norm1(x)
 
-        batch_size, n_channels, height, width = xc_orig.shape
-        # Move the channels to the end and collapse the spatial dimensions
-        xc = xc_orig.view(batch_size, n_channels, -1).permute(0, 2, 1)  # (B, HW, C)
-        # Project to QKV
-        qkv = self.projection(xc).view(
-            batch_size, -1, self.n_heads, self.head_dim * 3
-        )  # Split QKV to separate heads
-        q, k, v = torch.chunk(qkv, 3, dim=-1)  # (B, HW, H, C)
+        if q is None:
+            q = self.projection_q(x)
+        if k is None:
+            k = self.projection_k(x)
+        if v is None:
+            v = self.projection_v(x)
+
+        # Reshape
+        q = q.view(batch_size, -1, self.n_heads, self.head_dim)  # (B, HW, H, C)
+        k = k.view(batch_size, -1, self.n_heads, self.head_dim)  # (B, HW, H, C)
+        v = v.view(batch_size, -1, self.n_heads, self.head_dim)  # (B, HW, H, C)
+
         # Apply attention
         res = F.scaled_dot_product_attention(
             q, k, v, scale=self.scale, dropout_p=self.dropout if self.training else 0
         )
+        # Apply normalization
+        res = self.norm2(res)
         # Collapse the heads
         res = res.view(batch_size, -1, self.n_heads * self.head_dim)
         # Project back to the original dimension
         res = self.out(res)
         # Reshape to original shape
-        res = res.permute(0, 2, 1).view(xc_orig.shape)
+        res = res.view(batch_size, height, width, n_channels)
+        if channels_first:
+            res = res.permute(0, 3, 1, 2)
         # Apply residual connection
-        res += xc_orig
+        res += x_resid
         return res
+
+
+class SelfAttentionModule(nn.Module):
+    """
+    Multi-headed self-attention block, may use flash attention.
+    """
+
+    def __init__(
+        self,
+        n_channels: int,
+        n_heads: int = 1,
+        head_dim: int = None,
+        dropout: float = 0,
+    ):
+        """
+        :param n_channels: Number of channels.
+        :param n_heads: The number of heads.
+        :param head_dim: The dimension of each head. By default, uses the number of channels.
+        :param dropout: The dropout rate.
+        """
+        super().__init__()
+        if head_dim is None:
+            head_dim = n_channels
+
+        self.attn = AttentionModule(
+            n_channels,
+            n_heads=n_heads,
+            head_dim=head_dim,
+            dropout=dropout,
+            pre_norm=True,
+            # Compute Self-Attention
+            compute_q=True,
+            compute_k=True,
+            compute_v=True,
+        )
+
+    def forward(self, x: torch.Tensor, channels_first: bool = True):
+        return self.attn(x, channels_first=channels_first)
+
+
+class CrossAttentionModule(nn.Module):
+    """
+    Multi-headed cross-attention block, may use flash attention.
+    """
+
+    def __init__(
+        self,
+        n_channels: int,
+        n_heads: int = 1,
+        head_dim: int = None,
+        dropout: float = 0,
+        compute_q: bool = False,
+    ):
+        """
+        :param n_channels: Number of channels.
+        :param n_heads: The number of heads.
+        :param head_dim: The dimension of each head. By default, uses the number of channels.
+        :param dropout: The dropout rate.
+        :param compute_q: Whether to compute Q if it is not provided.
+        """
+        super().__init__()
+        if head_dim is None:
+            head_dim = n_channels
+
+        self.attn = AttentionModule(
+            n_channels,
+            n_heads=n_heads,
+            head_dim=head_dim,
+            dropout=dropout,
+            pre_norm=True,
+            # Compute Cross-Attention by providing Q, K, and V
+            compute_q=compute_q,
+            compute_k=False,
+            compute_v=False,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        channels_first: bool = True,
+    ):
+        return self.attn(x, q, k, v, channels_first=channels_first)
+
+
+class SelfAttentionBlock(nn.Module):
+    """
+    Basic Self-attention used in U-Nets.
+    """
+
+    def __init__(
+        self,
+        n_channels: int,
+        n_heads: int = 1,
+        head_dim: int = None,
+        dropout: float = 0,
+    ):
+        """
+        :param n_channels: Number of channels.
+        :param n_heads: The number of heads.
+        :param head_dim: The dimension of each head. By default, uses the number of channels.
+        :param dropout: The dropout rate.
+        :param act: The non-linearity to use.
+        """
+        super().__init__()
+        self.attn = SelfAttentionModule(
+            n_channels,
+            n_heads=n_heads,
+            head_dim=head_dim,
+            dropout=dropout,
+        )
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor, c: torch.Tensor):
+        # Self-attention ignores the time embedding and the conditional embedding
+        return self.attn(x, channels_first=True), c
+
+
+class ContextAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        n_channels: int,
+        n_context_channels: int,
+        n_heads: int = 1,
+        head_dim: int = None,
+        dropout: float = 0,
+        activation: type[nn.Module] = Swish,
+        n_groups: int = 32,
+    ):
+        """
+        Inspired by the ContextDiffusion paper: https://arxiv.org/pdf/2312.03584.pdf
+        The idea, apply self-attention to the image, then cross attention to the image with context embeddings from the
+            compressed image.
+        :param n_channels: Number of channels.
+        :param n_context_channels: The number of channels for the context embedding.
+        :param n_heads: The number of heads.
+        :param head_dim: The dimension of each head. By default, uses the number of channels.
+        :param dropout: The dropout rate.
+        :param activation: The non-linearity to use for context projections.
+        :param n_groups: The number of groups for group normalization.
+        """
+        super().__init__()
+        self.n_channels = n_channels
+
+        if head_dim is None:
+            head_dim = n_channels
+
+        self.self_attn = SelfAttentionModule(
+            n_channels,
+            n_heads=n_heads,
+            head_dim=head_dim,
+            dropout=dropout,
+        )
+        self.cross_attn = CrossAttentionModule(
+            n_channels,
+            n_heads=n_heads,
+            head_dim=head_dim,
+            dropout=dropout,
+            compute_q=True,
+        )
+
+        # Projection for the context image to match the number of channels
+        self.context_embedding = nn.Sequential(
+            nn.Conv2d(
+                n_context_channels,
+                n_channels,
+                kernel_size=(1, 1),
+            ),
+            nn.GroupNorm(n_groups, n_channels),
+            activation(),
+            nn.Conv2d(
+                n_channels,
+                n_channels,
+                kernel_size=(1, 1),
+            ),
+        )
+
+        self.context_proj = nn.Linear(n_channels, n_heads * head_dim)
+
+        # One final projection
+        self.out = nn.Sequential(
+            nn.LayerNorm(n_channels),
+            nn.Linear(n_channels, n_channels),
+        )
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        _initialize(self.context_embedding)
+        _initialize(self.context_proj)
+        _initialize(self.out)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor, c: torch.Tensor):
+        # TODO: Should we embed time?
+        # Channel last
+        x = x.permute(0, 2, 3, 1)
+
+        # In the paper, The Q in the cross attention is the output of the self-attention
+        x = self.self_attn(x, channels_first=False)
+        c_embed = self.context_embedding(c)
+        # Channel Last, then collapse HW
+        c_embed = c_embed.permute(0, 2, 3, 1).view(c.shape[0], -1, self.n_channels)
+        # Project to the k,v dimensions required for multi-head attention
+        c_embed = self.context_proj(c_embed)
+        x = self.cross_attn(x, q=None, k=c_embed, v=c_embed, channels_first=False)
+        x = self.out(x)
+        # Channel first
+        x = x.permute(0, 3, 1, 2)
+        # Reshape context embedding
+        c_embed = c_embed.permute(0, 2, 1).view(
+            c.shape[0], self.n_channels, *c.shape[2:]
+        )
+        return x, c_embed  #  TODO: Return original or projected context embedding?
+
+
+# Gated GeLU https://paperswithcode.com/method/geglu
+class GeGELU(nn.Module):
+    def __init__(self, dim_in: int, dim_out: int = None):
+        super().__init__()
+        if dim_out is None:
+            dim_out = dim_in
+        self.proj = nn.Linear(dim_in, dim_out * 2)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        _initialize(self.proj)
+
+    def forward(self, x):
+        x, gate = self.proj(x).chunk(2, dim=-1)
+        return x * F.gelu(gate)
+
+
+class BaseTransformerModule(nn.Module):
+    """
+    Basic Building block for the Transformer.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        cond_channels: int = None,
+        n_heads: int = 1,
+        head_dim: int = None,
+        context_attn: bool = True,
+        dropout: float = 0,
+        activation: type[nn.Module] = Swish,
+        n_groups: int = 32,
+    ):
+        super().__init__()
+        if cond_channels is None:
+            cond_channels = in_channels
+        if head_dim is None:
+            head_dim = in_channels
+
+        self.context_attn = context_attn
+        if context_attn:
+            self.block = ContextAttentionBlock(
+                in_channels,
+                cond_channels,
+                n_heads=n_heads,
+                head_dim=head_dim,
+                dropout=dropout,
+                activation=activation,
+                n_groups=n_groups,
+            )
+        else:
+            self.attn1 = SelfAttentionModule(
+                in_channels,
+                n_heads=n_heads,
+                head_dim=head_dim,
+                dropout=dropout,
+            )
+
+            self.attn2 = CrossAttentionModule(
+                in_channels,
+                n_heads=n_heads,
+                head_dim=head_dim,
+                dropout=dropout,
+                compute_q=True,
+            )
+
+        self.out = nn.Sequential(
+            nn.LayerNorm(in_channels),
+            GeGELU(in_channels, in_channels * 4),
+            nn.Dropout(dropout),
+            nn.Linear(in_channels * 4, in_channels),
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        _initialize(self.out)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor, c: torch.Tensor):
+        if self.context_attn:
+            x, c = self.block(x, t, c)
+        else:
+            x = self.attn1(x, channels_first=True)
+            x = self.attn2(x, None, c, c, channels_first=True)
+        # Channel first -> last
+        x = x.permute(0, 2, 3, 1)
+        x = x + self.out(x)
+        # Channel last -> first
+        x = x.permute(0, 3, 1, 2)
+        return x, c
+
+
+class TransformerBlock(nn.Module):
+    """
+    Instead of just using attention, we can use an entire transformer block (just like Stable Diffusion).
+    Based on the SpatialTransformer architecture from Stable Diffusion. https://nn.labml.ai/diffusion/stable_diffusion/model/unet_attention.html
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        cond_channels: int = None,
+        n_heads: int = 1,
+        n_blocks: int = 1,
+        head_dim: int = None,
+        context_attn: bool = True,
+        dropout: float = 0,
+        activation: type[nn.Module] = Swish,
+        n_groups: int = 32,
+    ):
+        super().__init__()
+        if cond_channels is None:
+            cond_channels = in_channels
+        if head_dim is None:
+            head_dim = in_channels
+
+        self.norm = nn.GroupNorm(n_groups, in_channels)
+
+        self.proj_in = nn.Conv2d(in_channels, in_channels, kernel_size=(1, 1))
+        self.proj_out = nn.Conv2d(in_channels, in_channels, kernel_size=(1, 1))
+
+        self.transformer = nn.ModuleList(
+            [
+                BaseTransformerModule(
+                    in_channels,
+                    cond_channels=cond_channels,
+                    n_heads=n_heads,
+                    head_dim=head_dim,
+                    context_attn=context_attn,
+                    dropout=dropout,
+                    activation=activation,
+                    n_groups=n_groups,
+                )
+                for _ in range(n_blocks)
+            ]
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        _initialize(self.proj_in)
+        _initialize(self.proj_out)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor, c: torch.Tensor):
+        x_init = x
+        x = self.proj_in(self.norm(x))
+        for block in self.transformer:
+            x, c = block(x, t, c)
+        x = self.proj_out(x)
+        return x + x_init, c
 
 
 class DownBlock(nn.Module):
@@ -1260,6 +1757,8 @@ class DownBlock(nn.Module):
         dropout: float = 0,
         act: type[nn.Module] = Swish,
         n_heads: int = 1,
+        context_attn=False,
+        transformer_blocks=0,
         embedding_type: Union[
             Literal["shift"], Literal["scale"], Literal["shift_and_scale"]
         ] = "shift",
@@ -1268,39 +1767,64 @@ class DownBlock(nn.Module):
         :param in_channels: The number of input channels.
         :param out_channels: The number of output channels.
         :param time_channels: The number of time embedding channels.
-        :param condition_channels: The number of channels for the conditional embedding.
         :param use_attention: Whether to apply attention.
         :param n_groups: The number of groups for group normalization.
         :param dropout: The dropout rate.
         :param act: The non-linearity to use.
         :param n_heads: The number of heads for attention.
+        :param context_attn: Whether to use context attention.
+        :param transformer_blocks: Use this many transformer blocks instead of a single attention.
         :param embedding_type: How to embed the time and condition channels. Either 'shift', 'scale', or 'shift_and_scale'.
         """
         super().__init__()
         self.residual = ResidualBlock(
             in_channels,
             out_channels,
+            in_channels,
             time_channels,
             n_groups=n_groups,
             dropout=dropout,
             act=act,
             embedding_style=embedding_type,
+            self_attn=use_attention,
+            n_heads=n_heads,
         )
         if use_attention:
-            self.attn = AttentionBlock(
-                out_channels,
-                n_groups=n_groups,
-                dropout=dropout,
-                n_heads=n_heads,
-            )
+            if transformer_blocks > 0:
+                self.attn = TransformerBlock(
+                    out_channels,
+                    cond_channels=out_channels,
+                    n_heads=n_heads,
+                    n_blocks=transformer_blocks,
+                    context_attn=context_attn,
+                    dropout=dropout,
+                    activation=act,
+                    n_groups=n_groups,
+                )
+            else:
+                if not context_attn:
+                    self.attn = SelfAttentionBlock(
+                        out_channels,
+                        dropout=dropout,
+                        n_heads=n_heads,
+                    )
+                else:
+                    self.attn = ContextAttentionBlock(
+                        out_channels,
+                        in_channels,
+                        dropout=dropout,
+                        n_heads=n_heads,
+                        activation=act,
+                        n_groups=n_groups,
+                    )
         else:
             self.attn = None
 
-    def forward(self, x, time):
-        x = self.residual(x, time)
+    def forward(self, x, time, c):
+        x, c = self.residual(x, time, c)
         if self.attn:
-            x = self.attn(x, time)
-        return x
+            x, c = self.attn(x, time, c)
+        return x, c
 
 
 class UpBlock(nn.Module):
@@ -1318,6 +1842,8 @@ class UpBlock(nn.Module):
         dropout: float = 0,
         act: type[nn.Module] = Swish,
         n_heads: int = 1,
+        context_attn=False,
+        transformer_blocks=0,
         embedding_type: Union[
             Literal["shift"], Literal["scale"], Literal["shift_and_scale"]
         ] = "shift",
@@ -1332,33 +1858,59 @@ class UpBlock(nn.Module):
         :param dropout: The dropout rate.
         :param act: The non-linearity to use.
         :param n_heads: The number of heads for attention.
+        :param context_attn: Whether to use context attention.
+        :param transformer_blocks: Use this many transformer blocks instead of a single attention.
         :param embedding_type: How to embed the time and condition channels. Either 'shift', 'scale', or 'shift_and_scale'.
         """
         super().__init__()
         self.residual = ResidualBlock(
             in_channels + out_channels,
             out_channels,
+            in_channels,
             time_channels,
             n_groups=n_groups,
             dropout=dropout,
             act=act,
             embedding_style=embedding_type,
+            self_attn=use_attention,
+            n_heads=n_heads,
         )
         if use_attention:
-            self.attn = AttentionBlock(
-                out_channels,
-                n_groups=n_groups,
-                dropout=dropout,
-                n_heads=n_heads,
-            )
+            if transformer_blocks > 0:
+                self.attn = TransformerBlock(
+                    out_channels,
+                    cond_channels=out_channels,
+                    n_heads=n_heads,
+                    n_blocks=transformer_blocks,
+                    context_attn=context_attn,
+                    dropout=dropout,
+                    activation=act,
+                    n_groups=n_groups,
+                )
+            else:
+                if not context_attn:
+                    self.attn = SelfAttentionBlock(
+                        out_channels,
+                        dropout=dropout,
+                        n_heads=n_heads,
+                    )
+                else:
+                    self.attn = ContextAttentionBlock(
+                        out_channels,
+                        in_channels,
+                        dropout=dropout,
+                        n_heads=n_heads,
+                        activation=act,
+                        n_groups=n_groups,
+                    )
         else:
             self.attn = None
 
-    def forward(self, x, time):
-        x = self.residual(x, time)
+    def forward(self, x, time, c):
+        x, c = self.residual(x, time, c)
         if self.attn:
-            x = self.attn(x, time)
-        return x
+            x, c = self.attn(x, time, c)
+        return x, c
 
 
 class MiddleBlock(nn.Module):
@@ -1373,6 +1925,9 @@ class MiddleBlock(nn.Module):
         n_groups: int = 32,
         dropout: float = 0,
         act: type[nn.Module] = Swish,
+        n_heads: int = 1,
+        context_attn=False,
+        transformer_blocks=0,
         embedding_type: Union[
             Literal["shift"], Literal["scale"], Literal["shift_and_scale"]
         ] = "shift",
@@ -1383,34 +1938,68 @@ class MiddleBlock(nn.Module):
         :param n_groups: The number of groups for group normalization.
         :param dropout: The dropout rate.
         :param act: The non-linearity to use.
+        :param context_attn: Whether to use context attention.
+        :param transformer_blocks: Use this many transformer blocks instead of a single attention.
         :param embedding_type: How to embed the time and condition channels. Either 'shift', 'scale', or 'shift_and_scale'.
         """
         super().__init__()
         self.residual1 = ResidualBlock(
             n_channels,
             n_channels,
+            n_channels,
             time_channels,
             n_groups=n_groups,
             dropout=dropout,
             act=act,
             embedding_style=embedding_type,
+            self_attn=True,
+            n_heads=n_heads,
         )
-        self.attn = AttentionBlock(n_channels, n_groups=n_groups, dropout=dropout)
+        if transformer_blocks > 0:
+            self.attn = TransformerBlock(
+                n_channels,
+                cond_channels=n_channels,
+                n_heads=n_heads,
+                n_blocks=transformer_blocks,
+                context_attn=context_attn,
+                dropout=dropout,
+                activation=act,
+                n_groups=n_groups,
+            )
+        else:
+            if not context_attn:
+                self.attn = SelfAttentionBlock(
+                    n_channels,
+                    dropout=dropout,
+                    n_heads=n_heads,
+                )
+            else:
+                self.attn = ContextAttentionBlock(
+                    n_channels,
+                    n_channels,
+                    dropout=dropout,
+                    n_heads=n_heads,
+                    activation=act,
+                    n_groups=n_groups,
+                )
         self.residual2 = ResidualBlock(
             n_channels,
             n_channels,
+            n_channels,
             time_channels,
             n_groups=n_groups,
             dropout=dropout,
             act=act,
             embedding_style=embedding_type,
+            self_attn=True,
+            n_heads=n_heads,
         )
 
-    def forward(self, x, t):
-        x = self.residual1(x, t)
-        x = self.attn(x, t)
-        x = self.residual2(x, t)
-        return x
+    def forward(self, x, t, c):
+        x, c = self.residual1(x, t, c)
+        x, c = self.attn(x, t, c)
+        x, c = self.residual2(x, t, c)
+        return x, c
 
 
 class Upsample(nn.Module):
@@ -1423,16 +2012,20 @@ class Upsample(nn.Module):
         :param n_channels: The number of input channels.
         """
         super().__init__()
-        self.deconv = nn.ConvTranspose2d(
+        self.deconv_img = nn.ConvTranspose2d(
+            n_channels, n_channels, kernel_size=(4, 4), stride=(2, 2), padding=(1, 1)
+        )
+        self.deconv_context = nn.ConvTranspose2d(
             n_channels, n_channels, kernel_size=(4, 4), stride=(2, 2), padding=(1, 1)
         )
         self.reset_parameters()
 
     def reset_parameters(self):
-        _initialize(self.deconv)
+        _initialize(self.deconv_img)
+        _initialize(self.deconv_context)
 
-    def forward(self, x, t):
-        return self.deconv(x)
+    def forward(self, x, t, c):
+        return self.deconv_img(x), self.deconv_context(c)
 
 
 class Downsample(nn.Module):
@@ -1445,13 +2038,17 @@ class Downsample(nn.Module):
         :param n_channels: The number of input channels.
         """
         super().__init__()
-        self.conv = nn.Conv2d(
+        self.conv_img = nn.Conv2d(
+            n_channels, n_channels, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)
+        )
+        self.conv_context = nn.Conv2d(
             n_channels, n_channels, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)
         )
         self.reset_parameters()
 
     def reset_parameters(self):
-        _initialize(self.conv)
+        _initialize(self.conv_img)
+        _initialize(self.conv_context)
 
-    def forward(self, x, t):
-        return self.conv(x)
+    def forward(self, x, t, c):
+        return self.conv_img(x), self.conv_context(c)

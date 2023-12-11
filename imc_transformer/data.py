@@ -32,7 +32,7 @@ from torchvision.transforms.v2 import (
 from torch import nn, optim, utils
 from torch.nn.utils.rnn import pad_sequence
 
-from imc_transformer.util import random_codebook, compress
+from util import random_codebook, compress
 
 
 def normalize_channel_ordering(
@@ -399,7 +399,9 @@ def fuse_imc_datasets(
         all_channels = list(set(itertools.chain(*all_channels)))
 
     all_data = []
+    all_masks = []
     for dataset in datasets:
+        all_masks.append(dataset.tensors[1])
         # If channels and ordering exactly match, don't need to do anything
         if all(
             [
@@ -422,7 +424,7 @@ def fuse_imc_datasets(
                 ]
         all_data.append(fixed_data)
 
-    dataset = TensorDataset(torch.cat(all_data, dim=0))
+    dataset = TensorDataset(torch.cat(all_data, dim=0), torch.cat(all_masks, dim=0))
     dataset.channel_labels = all_channels
     return dataset
 
@@ -532,15 +534,14 @@ class DirectoryDataset(utils.data.Dataset):
         return tuple([torch.load(path) for path in paths])
 
 
-@torch.jit.script
 def _apply_all(
-    tensor: Union[torch.Tensor, tuple[torch.Tensor]], funcs: list[torch.nn.Module]
+    tensor: tuple[torch.Tensor], funcs: list[torch.nn.Module]
 ) -> Union[torch.Tensor, tuple[torch.Tensor]]:
     if funcs is None or len(funcs) == 0:
         return tensor
 
     for func in funcs:
-        tensor = func(tensor)
+        tensor = func(*tensor)
     return tensor
 
 
@@ -555,11 +556,11 @@ class CodebookCompressionTransform(nn.Module):
 
     def forward(
         self, *x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # We will assume the first tensor is the data and the second is the mask
         uncompressed, mask = x
-        compressed = compress(uncompressed, self.codebook) * mask  # Ensure 0s are 0s
-        return compressed, uncompressed, mask
+        compressed = compress(uncompressed, self.codebook)  # Ensure 0s are 0s
+        return compressed, uncompressed, mask, self.codebook  # Return the codebook
 
 
 class LambdaDataset(utils.data.Dataset):
@@ -572,16 +573,23 @@ class LambdaDataset(utils.data.Dataset):
         dataset: utils.data.Dataset,
         all_transforms: list[torch.nn.Module],
         *split_transforms: list[torch.nn.Module],
+        transform_cutoff: int = None,  # Apply the "all_transforms" to the first transform_cutoff items
     ):
         self.dataset = dataset
         self.all_funcs = all_transforms
         self.split_funcs = split_transforms
+        self.transform_cutoff = transform_cutoff
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        transformed = _apply_all(self.dataset[idx], self.all_funcs)
+        if self.transform_cutoff is None:
+            transformed = _apply_all(self.dataset[idx], self.all_funcs)
+        else:
+            transformed = _apply_all(
+                self.dataset[idx][self.transform_cutoff :], self.all_funcs
+            )
         if self.split_funcs is None or len(self.split_funcs) == 0:
             return transformed
         transformed = tuple(
@@ -591,6 +599,8 @@ class LambdaDataset(utils.data.Dataset):
 
     # Defer attribute access to the dataset
     def __getattr__(self, name):
+        if name == "dataset":  # Prevent infinite recursion
+            return super().__getattr__(name)
         return getattr(self.dataset, name)
 
 
@@ -613,6 +623,7 @@ class InSilicoCompressedImcDataset(pl.LightningDataModule):
         random_translate: float = 0,
         random_scale: float = 0,
         spike_in_channels: int = 0,
+        regen_codebook: bool = False,
     ):
         super().__init__()
         self.batch_size = batch_size
@@ -632,6 +643,7 @@ class InSilicoCompressedImcDataset(pl.LightningDataModule):
         self.random_translate = random_translate
         self.random_scale = random_scale
         self.spike_in_channels = spike_in_channels
+        self.regen_codebook = regen_codebook
 
         if save_dir is None:
             all_dirs = [os.path.basename(dir) for dir in tiffs + mcds]
@@ -660,13 +672,15 @@ class InSilicoCompressedImcDataset(pl.LightningDataModule):
         self.channel_labels = dataset.channel_labels
 
         codebook_path = Path(self.save_dir) / "codebook.pt"
-        if self.codebook is None and not codebook_path.exists():
+        if self.codebook is None and (
+            not codebook_path.exists() or self.regen_codebook
+        ):
             assert self.spike_in_channels is None or isinstance(
                 self.spike_in_channels, int
             )
             self.codebook, self.spike_in_channels = random_codebook(
                 self.n_proteins,
-                n_compressed_channels=None,
+                n_compressed_channels=-1,
                 spike_in=self.spike_in_channels,
             )
             torch.save(
@@ -728,10 +742,11 @@ class InSilicoCompressedImcDataset(pl.LightningDataModule):
             self.train = LambdaDataset(
                 self.train,
                 [transforms],
-                [RandomErasing(p=self.random_erase), None, None]
+                [RandomErasing(p=self.random_erase), None, None, None]
                 if self.random_erase > 0
                 else None,  # Only apply erasing to the compressed input and not the mask or uncompressed input
                 None,
+                transform_cutoff=-1,  # Don't apply the tranbsforms to the codebook which is the last tensor
             )
 
         self.initialized = True

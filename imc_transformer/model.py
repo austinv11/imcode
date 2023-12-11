@@ -16,6 +16,7 @@ Options:
     --random_scale_augmentation=<frac>   Fraction of random scale augmentation during training (1 - frac) to (1 + frac)  [default: 0].
     --spike_in_channels=<spike_in_channels>   Number of channels to spike in [default: 0].
 """
+import os
 import sys
 from pathlib import Path
 from typing import Union
@@ -62,7 +63,7 @@ class ImcNet(pl.LightningModule):
         :param deepspeed: Whether to use deepspeed stage 2 efficiency optimizations within the model.
         """
         super().__init__()
-        self.optim_args = {"lr": 2e-4}
+        self.optim_args = {"lr": 2e-2}
         self.deepspeed = deepspeed
         self.sanity_check = sanity_check
         self.model = model
@@ -86,6 +87,7 @@ class ImcNet(pl.LightningModule):
                 channels=n_channels, out_channels=n_proteins, dropout=0.1
             )
         elif model == "diffusion":
+            # TODO: Make the model likelihood recreate the compression to calculate the loss
             print("Using Diffusion")
             self.module = DiffusionIMC(
                 compressed_channels=n_channels,
@@ -93,20 +95,25 @@ class ImcNet(pl.LightningModule):
                 n_steps=1_000,
                 # sampler='ddim',  # Seems broken?  Refer to this implementation https://nn.labml.ai/diffusion/stable_diffusion/sampler/ddim.html
                 sampler="jump",
-                # sampler="ddpm",  # FIXME: Poisson loss for ddpm
+                # sampler="overdispersed_jump",
+                # sampler="ddpm",  # FIXME: DDIM doesn't seem to work very well?
                 raw_counts=True,
                 unet=DiffusionUnet(
                     image_channels=n_proteins,
                     conditional_channels=n_channels,
                     out_image_channels=n_proteins,
+                    # out_image_channels=n_proteins
+                    # * 2,  # Need to multiply by 2 for overdispersed_jump
                     feature_channels=128,
-                    feature_mult=(1, 1, 1),
+                    feature_mult=(1, 1, 2),
                     use_attn=(False, True, True),
                     n_blocks=3,
                     n_groups=32,
                     dropout=0,
                     activation=nn.SiLU,
                     n_heads=1,
+                    context_attn=True,
+                    transformer_blocks=1,
                     embedding_type="shift_and_scale",
                 ),
             )
@@ -126,7 +133,7 @@ class ImcNet(pl.LightningModule):
         return self.step_impl("test", batch, batch_idx)
 
     def forward(self, batch, intermediate=False):
-        compressed, uncompressed, mask = batch
+        compressed, uncompressed, mask, codebook = batch
         if self.sanity_check:
             # Only use half the channels for computational efficiency
             uncompressed = uncompressed[:, 0 : self.channel_reordering.shape[0]]
@@ -140,7 +147,7 @@ class ImcNet(pl.LightningModule):
             return self.module(compressed)
 
     def step_impl(self, kind: str, batch, batch_idx):
-        compressed, uncompressed, mask = batch
+        compressed, uncompressed, mask, codebook = batch
 
         if self.sanity_check:
             # Only use half the channels for computational efficiency
@@ -151,7 +158,7 @@ class ImcNet(pl.LightningModule):
         # Where we try to recreate the compressed image from our predicted
         # true images?
         if self.model == "diffusion":
-            loss = self.module.loss(uncompressed, compressed, mask)
+            loss = self.module.loss(uncompressed, compressed, mask, codebook)
         else:
             pred = self.module(compressed)
 
@@ -242,6 +249,7 @@ def train_model(
         random_translate=random_translate_augmentation,
         random_scale=random_scale_augmentation,
         spike_in_channels=spike_in_channels,
+        regen_codebook=not os.path.exists("reg_finetune/last.ckpt"),
         # TODO: Random Affine transform?
     )
     dataset.prepare_data()
@@ -254,7 +262,7 @@ def train_model(
     # )
     model = ImcNet(
         input_size=dataset.size,
-        n_channels=dataset.n_channels + spike_in_channels,
+        n_channels=dataset.n_channels,
         n_proteins=dataset.n_proteins,
         deepspeed=deepspeed,
         sanity_check=sanity_check,
@@ -394,15 +402,17 @@ def _make_pdf(
             middle_index = out_channels // 2 - 1
             # Original image
             axis = axs[0, middle_index]
+            data = original_data[in_channel].cpu().numpy()
             title = "Original"
             if in_channel in spike_in_channels:
                 title += " (Spike-In)"
+            title += f"\nMin: {int(data.min())}, Max: {int(data.max())}"
             axis.set_title(
                 title,
                 fontsize=24,
                 fontweight="bold" if in_channel in spike_in_channels else "normal",
             )
-            clipped_original = visual_clip(original_data[in_channel].cpu().numpy())
+            clipped_original = visual_clip(data)
             axis.imshow(
                 clipped_original,
                 cmap="magma",
@@ -410,6 +420,7 @@ def _make_pdf(
                 # norm=matplotlib.colors.LogNorm(),
             )
             axis.axis("off")
+            # Remove all other axis elements (including y axis) except for the xlabel
             if not sanity_check:
                 # Make other images in the row blank
                 for out_channel in range(out_channels):
@@ -419,14 +430,15 @@ def _make_pdf(
                 for out_channel in range(out_channels):
                     axis = axs[1, out_channel]
                     axis.set_title(
-                        f"Compressed {out_channel}, Contains Input: {codebook[in_channel, out_channel].item()}",
+                        f"Compressed {out_channel}, Contains Input: {bool(codebook[in_channel, out_channel].item())}\nMin: {int(data.min())}, Max: {int(data.max())}",
                         fontsize=24,
                         fontweight="bold"
                         if codebook[in_channel, out_channel].item()
                         else "normal",
                     )
+                    data = compressed_data[out_channel].cpu().numpy()
                     axis.imshow(
-                        visual_clip(compressed_data[out_channel].cpu().numpy()),
+                        visual_clip(data),
                         cmap="magma",
                         vmin=0,
                         # norm=matplotlib.colors.LogNorm(),
@@ -442,12 +454,13 @@ def _make_pdf(
                     else:
                         ti = len(predicted_data) - 1
                         # Ensure final time step is included
+                    data = predicted_data[ti][in_channel].cpu().numpy()
                     axis.set_title(
-                        f"Predicted T={ti}",
+                        f"Predicted T={ti}\nMin: {int(data.min())}, Max: {int(data.max())}",
                         fontsize=24,
                     )
                     axis.imshow(
-                        predicted_data[ti][in_channel].cpu().numpy(),
+                        np.clip(data, 0, np.max(clipped_original)),
                         cmap="magma",
                         vmin=0,
                         # norm=matplotlib.colors.LogNorm(),
@@ -455,9 +468,13 @@ def _make_pdf(
                     axis.axis("off")
             else:
                 axis = axs[2 if not sanity_check else 1, middle_index]
-                axis.set_title("Predicted", fontsize=24)
+                data = predicted_data[in_channel].cpu().numpy()
+                axis.set_title(
+                    f"Predicted\nMin: {int(data.min())}, Max: {int(data.max())}",
+                    fontsize=24,
+                )
                 axis.imshow(
-                    predicted_data[in_channel].cpu().numpy(),
+                    np.clip(data, 0, np.max(clipped_original)),
                     cmap="magma",
                     vmin=0,
                     # norm=matplotlib.colors.LogNorm(),
@@ -499,7 +516,7 @@ def generate_examples(
     # Shuffle the test dataset
     test_dataset = utils.data.Subset(test_dataset, torch.randperm(len(test_dataset)))
     dataloader = utils.data.DataLoader(test_dataset, batch_size=1, shuffle=True)
-    for i, (compressed, uncompressed, mask) in tqdm(
+    for i, (compressed, uncompressed, mask, codebook) in tqdm(
         enumerate(dataloader), total=n_samples, desc="Generating Examples"
     ):
         if i >= n_samples:
@@ -508,7 +525,7 @@ def generate_examples(
             pred = [
                 p.squeeze(0)
                 for p in model.forward(
-                    (compressed, uncompressed, mask), intermediate=True
+                    (compressed, uncompressed, mask, codebook), intermediate=True
                 )
             ]
         else:

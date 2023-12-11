@@ -19,7 +19,7 @@ process prepareData {
         path script_dir
 
     """
-    python-conda imc_transformer/data.py ${data_path} compiled_data --image_size=64 --patch_overlap=0.005
+    python-conda imc_transformer/data.py ${data_path} compiled_data --image_size=256 --patch_overlap=0.005
     """
 }
 
